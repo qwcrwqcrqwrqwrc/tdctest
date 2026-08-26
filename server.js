@@ -337,7 +337,7 @@ async function fetchYouTubeStatus() {
                   };
 
                   ytCache.data = result;
-                  ytCache.expiresAt = now + (30 * 1000); 
+                  ytCache.expiresAt = now + (5 * 1000); 
                   return result;
               }
           }
@@ -347,7 +347,7 @@ async function fetchYouTubeStatus() {
     // Kanalda canli yayin yok
     const offlineResult = { platform: 'youtube', is_live: false, viewer_count: 0, title: '', thumbnail: '', channel_url: channelUrl };
     ytCache.data = offlineResult;
-    ytCache.expiresAt = now + (60 * 1000); // 1 dakika önbellek
+    ytCache.expiresAt = now + (5 * 1000); // 5 saniye önbellek
     return offlineResult;
 
   } catch (err) {
