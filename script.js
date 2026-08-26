@@ -136,10 +136,10 @@ document.addEventListener('DOMContentLoaded', function () {
   startAutoplay();
 
   // ══════════════════════════════════════════════════
-  //  STREAM STATUS MANAGER - Kick Live API
+  //  STREAM STATUS MANAGER (Kick & YouTube)
   // ══════════════════════════════════════════════════
 
-  const STREAM_POLL_INTERVAL = 5000; // 5 saniye
+  const STREAM_POLL_INTERVAL = 10000; // Production: 10 saniye polling
   const API_BASE = window.location.origin; // Same origin (proxy server)
 
   /**
@@ -275,16 +275,23 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   /**
-   * Start polling loop
+   * Start polling loop & visibility handling
    */
   function startStreamPolling() {
     // İlk çağrıyı hemen yap
     fetchStreamStatus();
 
-    // Sonra her 30 saniyede tekrarla
+    // Periyodik güncelleme (10 saniye)
     setInterval(fetchStreamStatus, STREAM_POLL_INTERVAL);
 
-    console.log('[StreamStatus] Polling başladı — her', STREAM_POLL_INTERVAL / 1000, 'saniyede güncelleme');
+    // Kullanıcı sekmeye geri döndüğünde anında yenile
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) {
+        fetchStreamStatus();
+      }
+    });
+
+    console.log('[StreamStatus] Production Polling aktif — her', STREAM_POLL_INTERVAL / 1000, 'saniyede bir sorgu');
   }
 
   // Start polling (only if running from server, not file://)
