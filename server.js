@@ -190,6 +190,20 @@ app.get('/api/kick-status', async (req, res) => {
   }
 });
 
+app.get('/api/youtube-status', async (req, res) => {
+  try {
+    const status = await fetchYouTubeStatus();
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({
+      platform: 'youtube',
+      is_live: false,
+      viewer_count: 0,
+      error: err.message
+    });
+  }
+});
+
 // ══════════════════════════════════════════════════
 //  COMBINED STATUS ENDPOINT (fetch both at once)
 // ══════════════════════════════════════════════════
@@ -319,11 +333,13 @@ async function fetchYouTubeStatus() {
           if (videoData.items && videoData.items.length > 0) {
               const item = videoData.items[0];
               
-              // Eger video canli yayin degilse liveStreamingDetails olmaz
-              if (item.liveStreamingDetails) {
+              // Sadece aktif olarak yayında olan (liveBroadcastContent === 'live' ve bitiş tarihi olmayan) videolar canlıdır
+              const isLive = item.snippet?.liveBroadcastContent === 'live' && !item.liveStreamingDetails?.actualEndTime;
+
+              if (isLive) {
                   title = item.snippet?.title || '';
-                  thumbnail = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '';
-                  if (item.liveStreamingDetails.concurrentViewers) {
+                  thumbnail = item.snippet?.thumbnails?.maxres?.url || item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '';
+                  if (item.liveStreamingDetails?.concurrentViewers) {
                       viewerCount = parseInt(item.liveStreamingDetails.concurrentViewers, 10);
                   }
                   
