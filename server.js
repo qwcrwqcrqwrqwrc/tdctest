@@ -269,7 +269,11 @@ async function fetchYouTubeStatus() {
     // 1. YouTube Data API'nin "search" komutu canli yayinlari asiri gec algiladigi icin,
     // garantili yöntem olan "canonical URL" kontrolü yapiyoruz. (Bu yöntem hem hizli hem de 100 API kotasi harcamaz)
     const pageResp = await fetch(channelUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      headers: { 
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Cookie': 'CONSENT=YES+cb.20230101-00-p0.tr+FX+0'
+      }
     });
     
     if (!pageResp.ok) {
