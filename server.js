@@ -5,6 +5,9 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ── Production Reverse Proxy Desteği (Render, Cloudflare, Nginx vb.) ──
+app.set('trust proxy', 1);
+
 // ── WebSub (PubSubHubbub) XML ve Gövde Ayrıştırıcıları ──
 app.use(express.text({ type: ['application/atom+xml', 'text/xml', 'application/xml', 'text/plain'] }));
 app.use(express.json());
@@ -21,14 +24,36 @@ app.use((req, res, next) => {
 });
 
 // ══════════════════════════════════════════════════
-//  TOKEN CACHE
+//  TIMING & CACHE AYARLARI (PRODUCTION-GRADE)
+// ══════════════════════════════════════════════════
+const TIMINGS = {
+  KICK_STATUS_CACHE_TTL: 15 * 1000,       // 15 saniye (Kick API rate-limit koruması)
+  YT_LIVE_CACHE_TTL: 30 * 1000,          // 30 saniye (Canlı yayında izleyici sayısı ve durum tazeleme)
+  YT_OFFLINE_CACHE_TTL: 30 * 1000,       // 30 saniye (YouTube Data API günlük 10K kota tasarrufu)
+  WEBSUB_LEASE_SECONDS: 864000,          // 10 gün (Google WebSub azami abonelik süresi)
+  WEBSUB_RENEWAL_INTERVAL: 24 * 60 * 60 * 1000 // 24 saatte bir otomatik abonelik tazeleme (Abonelik koruması)
+};
+
+// ══════════════════════════════════════════════════
+//  TOKEN & STATUS CACHES (RAM)
 // ══════════════════════════════════════════════════
 const tokenCache = {
   kick: { token: null, expiresAt: 0 }
 };
 
+const kickCache = {
+  data: null,
+  expiresAt: 0
+};
+
+const ytCache = {
+  data: null,
+  expiresAt: 0,
+  latestVideoId: null
+};
+
 // ══════════════════════════════════════════════════
-//  KICK API
+//  KICK API (OFFICIAL OAUTH2 + FALLBACK)
 // ══════════════════════════════════════════════════
 
 async function getKickAppToken() {
@@ -66,7 +91,7 @@ async function getKickAppToken() {
   // 5 dakika önce expire olarak yenile
   tokenCache.kick.expiresAt = now + (data.expires_in - 300) * 1000;
 
-  console.log('[Kick] App Access Token alındı, geçerlilik:', data.expires_in, 's');
+  console.log('[Kick] App Access Token yenilendi (Geçerlilik:', data.expires_in, 'saniye)');
   return data.access_token;
 }
 
@@ -74,7 +99,6 @@ async function getKickChannelSlug() {
   return process.env.KICK_CHANNEL_SLUG || 'turkdostclan';
 }
 
-// Kick'ten user ID almak için slug ile arama yap (ilk çalıştırmada)
 let kickUserId = null;
 
 async function resolveKickUserId(token) {
@@ -93,23 +117,27 @@ async function resolveKickUserId(token) {
       const data = await resp.json();
       kickUserId = data.user_id || data.user?.id;
       if (kickUserId) {
-        console.log('[Kick] User ID çözümlendi:', kickUserId, 'slug:', slug);
+        console.log('[Kick] User ID çözümlendi:', kickUserId, '(slug:', slug + ')');
         return kickUserId;
       }
     }
   } catch (e) {
-    console.warn('[Kick] v2 channels API erişilemedi, fallback kullanılacak:', e.message);
+    console.warn('[Kick] v2 channels API fallback hatası:', e.message);
   }
 
   return null;
 }
 
-app.get('/api/kick-status', async (req, res) => {
+async function fetchKickStatus() {
+  const now = Date.now();
+  if (kickCache.data && now < kickCache.expiresAt) {
+    return kickCache.data;
+  }
+
+  const slug = await getKickChannelSlug();
+
   try {
     const token = await getKickAppToken();
-    const slug = await getKickChannelSlug();
-
-    // Method 1: Try official API with user ID
     const userId = await resolveKickUserId(token);
 
     if (userId) {
@@ -125,29 +153,35 @@ app.get('/api/kick-status', async (req, res) => {
         const streams = apiData.data || [];
 
         if (streams.length > 0) {
-          const stream = streams[0];
-          return res.json({
+          const s = streams[0];
+          const result = {
             platform: 'kick',
             is_live: true,
-            viewer_count: stream.viewer_count || 0,
-            title: stream.title || '',
-            thumbnail: stream.thumbnail || '',
+            viewer_count: s.viewer_count || 0,
+            title: s.title || '',
+            thumbnail: s.thumbnail || '',
             channel_url: `https://kick.com/${slug}`
-          });
+          };
+          kickCache.data = result;
+          kickCache.expiresAt = now + TIMINGS.KICK_STATUS_CACHE_TTL;
+          return result;
         } else {
-          return res.json({
+          const result = {
             platform: 'kick',
             is_live: false,
             viewer_count: 0,
             title: '',
             thumbnail: '',
             channel_url: `https://kick.com/${slug}`
-          });
+          };
+          kickCache.data = result;
+          kickCache.expiresAt = now + TIMINGS.KICK_STATUS_CACHE_TTL;
+          return result;
         }
       }
     }
 
-    // Method 2: Fallback to undocumented v2 API (from server, no CORS issue)
+    // Fallback: v2 API
     const fallbackResp = await fetch(`https://kick.com/api/v2/channels/${slug}`, {
       headers: {
         'Accept': 'application/json',
@@ -158,19 +192,20 @@ app.get('/api/kick-status', async (req, res) => {
     if (fallbackResp.ok) {
       const chData = await fallbackResp.json();
       const ls = chData.livestream;
-
-      return res.json({
+      const result = {
         platform: 'kick',
         is_live: !!ls && ls.is_live === true,
         viewer_count: ls ? (ls.viewer_count || 0) : 0,
         title: ls ? (ls.session_title || '') : '',
         thumbnail: ls ? (ls.thumbnail?.url || '') : '',
         channel_url: `https://kick.com/${slug}`
-      });
+      };
+      kickCache.data = result;
+      kickCache.expiresAt = now + TIMINGS.KICK_STATUS_CACHE_TTL;
+      return result;
     }
 
-    // If both fail
-    return res.json({
+    const offlineResult = {
       platform: 'kick',
       is_live: false,
       viewer_count: 0,
@@ -178,36 +213,35 @@ app.get('/api/kick-status', async (req, res) => {
       thumbnail: '',
       channel_url: `https://kick.com/${slug}`,
       error: 'Kick API erişilemedi'
-    });
+    };
+    kickCache.data = offlineResult;
+    kickCache.expiresAt = now + TIMINGS.KICK_STATUS_CACHE_TTL;
+    return offlineResult;
 
   } catch (err) {
     console.error('[Kick] Hata:', err.message);
-    res.status(500).json({
+    const errResult = {
       platform: 'kick',
       is_live: false,
       viewer_count: 0,
+      channel_url: `https://kick.com/${slug}`,
       error: err.message
-    });
+    };
+    kickCache.data = errResult;
+    kickCache.expiresAt = now + TIMINGS.KICK_STATUS_CACHE_TTL;
+    return errResult;
   }
+}
+
+app.get('/api/kick-status', async (req, res) => {
+  const status = await fetchKickStatus();
+  res.json(status);
 });
 
 app.get('/api/youtube-status', async (req, res) => {
-  try {
-    const status = await fetchYouTubeStatus();
-    res.json(status);
-  } catch (err) {
-    res.status(500).json({
-      platform: 'youtube',
-      is_live: false,
-      viewer_count: 0,
-      error: err.message
-    });
-  }
+  const status = await fetchYouTubeStatus();
+  res.json(status);
 });
-
-// ══════════════════════════════════════════════════
-//  COMBINED STATUS ENDPOINT (fetch both at once)
-// ══════════════════════════════════════════════════
 
 app.get('/api/stream-status', async (req, res) => {
   try {
@@ -225,51 +259,11 @@ app.get('/api/stream-status', async (req, res) => {
   }
 });
 
-// Internal helpers for combined endpoint
-async function fetchKickStatus() {
-  const token = await getKickAppToken();
-  const slug = process.env.KICK_CHANNEL_SLUG || 'turkdostclan';
-  const userId = await resolveKickUserId(token);
-
-  if (userId) {
-    const apiResp = await fetch(`https://api.kick.com/public/v1/users/livestreams?user_id=${userId}`, {
-      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
-    });
-    if (apiResp.ok) {
-      const apiData = await apiResp.json();
-      const streams = apiData.data || [];
-      if (streams.length > 0) {
-        const s = streams[0];
-        return { platform: 'kick', is_live: true, viewer_count: s.viewer_count || 0, title: s.title || '', thumbnail: s.thumbnail || '', channel_url: `https://kick.com/${slug}` };
-      }
-      return { platform: 'kick', is_live: false, viewer_count: 0, title: '', thumbnail: '', channel_url: `https://kick.com/${slug}` };
-    }
-  }
-
-  // Fallback
-  const fbResp = await fetch(`https://kick.com/api/v2/channels/${slug}`, {
-    headers: { 'Accept': 'application/json', 'User-Agent': 'TDC-StreamProxy/1.0' }
-  });
-  if (fbResp.ok) {
-    const ch = await fbResp.json();
-    const ls = ch.livestream;
-    return { platform: 'kick', is_live: !!ls && ls.is_live === true, viewer_count: ls ? (ls.viewer_count || 0) : 0, title: ls ? (ls.session_title || '') : '', thumbnail: ls ? (ls.thumbnail?.url || '') : '', channel_url: `https://kick.com/${slug}` };
-  }
-
-  return { platform: 'kick', is_live: false, viewer_count: 0, channel_url: `https://kick.com/${slug}` };
-}
-
 // ══════════════════════════════════════════════════
 //  YOUTUBE 2-KATMANLI MİMARİ
-//  1. Katman: WebSub (PubSubHubbub) Webhook (Anlık Push)
-//  2. Katman: YouTube RSS Feed (Polling & Fallback)
+//  Katman 1: WebSub (PubSubHubbub) Webhook (Anlık Push)
+//  Katman 2: YouTube RSS XML Feed (Polling & Fallback)
 // ══════════════════════════════════════════════════
-
-const ytCache = {
-  data: null,
-  expiresAt: 0,
-  latestVideoId: null
-};
 
 /**
  * YouTube Data API v3 ile Video ID'sinin Canlılık ve Yayın Detaylarını Doğrular
@@ -377,7 +371,7 @@ async function fetchLatestVideoIdFromRSS(channelId) {
 }
 
 /**
- * YouTube Durumunu Getirir (Önbellek -> WebSub Push Durumu -> RSS & Data API)
+ * YouTube Durumunu Getirir (RAM Önbellek -> RSS & Data API Doğrulama)
  */
 async function fetchYouTubeStatus() {
   const now = Date.now();
@@ -403,7 +397,8 @@ async function fetchYouTubeStatus() {
       const result = await checkYouTubeVideoDetails(latestVideoId);
       if (result) {
         ytCache.data = result;
-        ytCache.expiresAt = now + (10 * 1000); // 10 saniye önbellek
+        // Canlıysa 15 sn, offline ise 30 sn cache süresi uygula (Kota tasarrufu)
+        ytCache.expiresAt = now + (result.is_live ? TIMINGS.YT_LIVE_CACHE_TTL : TIMINGS.YT_OFFLINE_CACHE_TTL);
         ytCache.latestVideoId = latestVideoId;
         return result;
       }
@@ -420,7 +415,7 @@ async function fetchYouTubeStatus() {
     };
 
     ytCache.data = offlineResult;
-    ytCache.expiresAt = now + (10 * 1000);
+    ytCache.expiresAt = now + TIMINGS.YT_OFFLINE_CACHE_TTL;
     return offlineResult;
 
   } catch (err) {
@@ -472,9 +467,9 @@ app.post('/api/youtube-webhook', async (req, res) => {
       const status = await checkYouTubeVideoDetails(videoId);
       if (status) {
         ytCache.data = status;
-        ytCache.expiresAt = Date.now() + (15 * 1000);
+        ytCache.expiresAt = Date.now() + (status.is_live ? TIMINGS.YT_LIVE_CACHE_TTL : TIMINGS.YT_OFFLINE_CACHE_TTL);
         ytCache.latestVideoId = videoId;
-        console.log(`[YouTube WebSub] ⚡ Canlı yayın durumu güncellendi: ${status.is_live ? '🟢 CANLI (' + status.viewer_count + ' izleyici)' : '⚫ OFFLINE'}`);
+        console.log(`[YouTube WebSub] ⚡ Canlı yayın durumu anında güncellendi: ${status.is_live ? '🟢 CANLI (' + status.viewer_count + ' izleyici)' : '⚫ OFFLINE'}`);
       }
     } else {
       console.log('[YouTube WebSub] XML içinde Video ID bulunamadı veya silinme bildirimi.');
@@ -509,7 +504,7 @@ async function subscribeToYouTubeWebSub() {
     'hub.topic': topicUrl,
     'hub.mode': 'subscribe',
     'hub.verify': 'async',
-    'hub.lease_seconds': '864000' // 10 gün
+    'hub.lease_seconds': String(TIMINGS.WEBSUB_LEASE_SECONDS)
   });
 
   try {
@@ -532,11 +527,11 @@ async function subscribeToYouTubeWebSub() {
 }
 
 // ══════════════════════════════════════════════════
-//  START SERVER
+//  START SERVER & BACKGROUND SCHEDULES
 // ══════════════════════════════════════════════════
 
 app.listen(PORT, async () => {
-  console.log(`\n🎮 TurkDostClan Stream Proxy çalışıyor: http://localhost:${PORT}`);
+  console.log(`\n🎮 TurkDostClan Stream Proxy (Production Mode) çalışıyor: Port ${PORT}`);
   console.log(`   Kick kanal: ${process.env.KICK_CHANNEL_SLUG || 'turkdostclan'}`);
   console.log(`   YouTube kanal: ${process.env.YOUTUBE_CHANNEL_HANDLE || '@turkdostclan55'}`);
 
@@ -544,16 +539,16 @@ app.listen(PORT, async () => {
   const ytOk = process.env.YOUTUBE_API_KEY && !process.env.YOUTUBE_API_KEY.startsWith('BURAYA');
 
   if (!kickOk) console.warn('   ⚠️  Kick API anahtarları tanımlı değil (.env dosyasını düzenle)');
-  if (kickOk) console.log('   ✅ Kick API anahtarları tanımlı');
+  if (kickOk) console.log('   ✅ Kick API anahtarları tanımlı (15s RAM önbellek aktif)');
 
   if (!ytOk) console.warn('   ⚠️  YouTube API Key eksik (.env dosyasını düzenle)');
   if (ytOk) {
     console.log('   ✅ YouTube API Key tanımlı');
-    console.log('   ✅ 2-Katmanlı YouTube Mimarisi devrede (Katman 1: WebSub Webhook | Katman 2: RSS Feed)');
-    // WebSub aboneliğini başlat
+    console.log('   ✅ 2-Katmanlı YouTube Mimarisi devrede (Katman 1: WebSub Push | Katman 2: RSS Feed)');
+    // İlk abonelik talebini gönder
     await subscribeToYouTubeWebSub();
     // 24 saatte bir WebSub aboneliğini tazele
-    setInterval(subscribeToYouTubeWebSub, 24 * 60 * 60 * 1000);
+    setInterval(subscribeToYouTubeWebSub, TIMINGS.WEBSUB_RENEWAL_INTERVAL);
   }
   console.log();
 });
