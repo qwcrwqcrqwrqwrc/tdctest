@@ -248,7 +248,23 @@ async function fetchKickStatus() {
 //  YOUTUBE API STATUS FETCH
 // ══════════════════════════════════════════════════
 
+let ytChannelIdCache = null;
 const ytCache = { data: null, expiresAt: 0 };
+
+async function getYouTubeChannelId(apiKey, handle, referer) {
+  if (ytChannelIdCache) return ytChannelIdCache;
+  const resp = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=${handle}&key=${apiKey}`, {
+    headers: { 'Referer': referer }
+  });
+  if (resp.ok) {
+    const data = await resp.json();
+    if (data.items && data.items.length > 0) {
+      ytChannelIdCache = data.items[0].id;
+      return ytChannelIdCache;
+    }
+  }
+  return null;
+}
 
 async function fetchYouTubeStatus() {
   const now = Date.now();
@@ -266,59 +282,66 @@ async function fetchYouTubeStatus() {
   }
 
   try {
-    // 1. YouTube Data API'nin "search" komutu canli yayinlari asiri gec algiladigi icin,
-    // garantili yöntem olan "canonical URL" kontrolü yapiyoruz. (Bu yöntem hem hizli hem de 100 API kotasi harcamaz)
-    const pageResp = await fetch(channelUrl, {
-      headers: { 
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-          'Cookie': 'CONSENT=YES+cb.20230101-00-p0.tr+FX+0'
-      }
-    });
+    // Google Cloud API Referer kisitlamasini asmak icin proxy sunucunun adresini iletiyoruz
+    const referer = process.env.RENDER_EXTERNAL_URL || 'https://tdctest.onrender.com/';
     
-    if (!pageResp.ok) {
-        throw new Error(`Kanal sayfasi okunamadi: ${pageResp.status}`);
+    let channelId = process.env.YOUTUBE_CHANNEL_ID;
+    if (!channelId) {
+       channelId = await getYouTubeChannelId(apiKey, handle, referer);
     }
     
-    const pageHtml = await pageResp.text();
-    const match = pageHtml.match(/<link rel="canonical" href="(.*?)"/);
+    if (!channelId) {
+      throw new Error('Kanal ID bulunamadi');
+    }
+
+    // Render vb. bulut sunucularinin IP'leri YouTube tarafindan (Bot/Consent) engellendigi icin 
+    // veya YouTube API Search gecikmeli calistigi icin "Decapi" uzerinden guncel videoyu buluyoruz.
+    const decapiResp = await fetch(`https://decapi.me/youtube/latest_video?id=${channelId}`);
+    if (!decapiResp.ok) throw new Error(`Decapi Hatasi: ${decapiResp.status}`);
     
-    if (match && match[1] && match[1].includes('watch?v=')) {
-      // Kanal su an canli yayinda, video ID'sini aldik
-      const videoUrl = match[1];
-      const videoId = videoUrl.split('watch?v=')[1];
+    const decapiText = await decapiResp.text();
+    
+    const match = decapiText.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+    
+    if (match && match[1]) {
+      const videoId = match[1];
       
-      // 2. YouTube Data API v3 kullanarak (1 kota harcar) bu videonun izleyici sayisini ve basligini aliyoruz
       let viewerCount = 0;
       let title = '';
       let thumbnail = '';
       
-      const videoResp = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${apiKey}`);
+      const videoResp = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${apiKey}`, {
+         headers: { 'Referer': referer }
+      });
+      
       if (videoResp.ok) {
           const videoData = await videoResp.json();
           if (videoData.items && videoData.items.length > 0) {
               const item = videoData.items[0];
-              title = item.snippet?.title || '';
-              thumbnail = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '';
               
-              if (item.liveStreamingDetails && item.liveStreamingDetails.concurrentViewers) {
-                  viewerCount = parseInt(item.liveStreamingDetails.concurrentViewers, 10);
+              // Eger video canli yayin degilse liveStreamingDetails olmaz
+              if (item.liveStreamingDetails) {
+                  title = item.snippet?.title || '';
+                  thumbnail = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '';
+                  if (item.liveStreamingDetails.concurrentViewers) {
+                      viewerCount = parseInt(item.liveStreamingDetails.concurrentViewers, 10);
+                  }
+                  
+                  const result = {
+                      platform: 'youtube',
+                      is_live: true,
+                      viewer_count: viewerCount,
+                      title: title,
+                      thumbnail: thumbnail,
+                      channel_url: `https://www.youtube.com/watch?v=${videoId}`
+                  };
+
+                  ytCache.data = result;
+                  ytCache.expiresAt = now + (30 * 1000); 
+                  return result;
               }
           }
       }
-      
-      const result = {
-          platform: 'youtube',
-          is_live: true,
-          viewer_count: viewerCount,
-          title: title,
-          thumbnail: thumbnail,
-          channel_url: videoUrl
-      };
-
-      ytCache.data = result;
-      ytCache.expiresAt = now + (30 * 1000); // 30 saniye önbellek (kota sorunu yok, sadece 1 kota harciyor)
-      return result;
     }
     
     // Kanalda canli yayin yok
