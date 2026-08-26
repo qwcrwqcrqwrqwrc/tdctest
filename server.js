@@ -274,6 +274,7 @@ async function checkYouTubeVideoDetails(videoId) {
   let handle = process.env.YOUTUBE_CHANNEL_HANDLE || '@turkdostclan55';
   if (!handle.startsWith('@')) handle = '@' + handle;
   const channelUrl = `https://www.youtube.com/${handle}/live`;
+  const targetChannelId = process.env.YOUTUBE_CHANNEL_ID || 'UCNpMoAARNn9fenbbyWZB2Wg';
   const referer = process.env.WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL || 'https://tdctest.onrender.com/';
 
   if (!apiKey || apiKey.startsWith('BURAYA') || !videoId) {
@@ -297,6 +298,19 @@ async function checkYouTubeVideoDetails(videoId) {
     const videoData = await videoResp.json();
     if (videoData.items && videoData.items.length > 0) {
       const item = videoData.items[0];
+
+      // GÜVENLİK KONTROLÜ: Video kesinlikle bizim kanalımıza mı ait?
+      if (item.snippet?.channelId && targetChannelId && item.snippet.channelId !== targetChannelId) {
+        console.warn(`[YouTube API] Güvenlik Engeli: Video (${videoId}) TürkDostClan kanalına ait değil! (Gelen: ${item.snippet.channelId}, Beklenen: ${targetChannelId})`);
+        return {
+          platform: 'youtube',
+          is_live: false,
+          viewer_count: 0,
+          title: '',
+          thumbnail: '',
+          channel_url: channelUrl
+        };
+      }
 
       // Canlı yayın kontrolü: liveBroadcastContent === 'live' ve actualEndTime olmamalıdır
       const isLive = item.snippet?.liveBroadcastContent === 'live' && !item.liveStreamingDetails?.actualEndTime;
@@ -367,7 +381,7 @@ async function fetchLiveVideoIdDirectly(handle, channelId) {
 
       if (!resp.ok) continue;
 
-      // 1. URL yönlendirmesinde watch?v= var mı?
+      // 1. URL doğrudan watch?v= formatına yönlendirildiyse
       const urlMatch = resp.url.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
       if (urlMatch && urlMatch[1]) {
         return urlMatch[1];
@@ -375,23 +389,10 @@ async function fetchLiveVideoIdDirectly(handle, channelId) {
 
       const html = await resp.text();
 
-      // Canonical watch URL'si var mı? (YouTube canlı yayındayken canonical olarak watch?v= döner)
+      // 2. Canonical watch URL'si var mı? (Kanal canlı yayındayken YouTube canonical URL'yi watch?v= yapar)
       const canonicalMatch = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})"/);
       if (canonicalMatch && canonicalMatch[1]) {
         return canonicalMatch[1];
-      }
-
-      // Canlı yayın bayrağı kontrolü
-      const isLiveIndicator = html.includes('"isLive":true') || 
-                              html.includes('"isLiveBroadcast":true') || 
-                              html.includes('"status":"LIVE"') ||
-                              html.includes('"isLiveContent":true');
-
-      if (isLiveIndicator) {
-        const vidMatch = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-        if (vidMatch && vidMatch[1]) {
-          return vidMatch[1];
-        }
       }
     } catch (err) {
       console.warn(`[YouTube /live] ${url} kontrol hatası:`, err.message);
