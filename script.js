@@ -139,7 +139,7 @@ document.addEventListener('DOMContentLoaded', function () {
   //  STREAM STATUS MANAGER - Kick Live API
   // ══════════════════════════════════════════════════
 
-  const STREAM_POLL_INTERVAL = 30000; // 30 saniye
+  const STREAM_POLL_INTERVAL = 5000; // 5 saniye
   const API_BASE = window.location.origin; // Same origin (proxy server)
 
   /**
