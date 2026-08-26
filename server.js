@@ -262,23 +262,7 @@ async function fetchKickStatus() {
 //  YOUTUBE API STATUS FETCH
 // ══════════════════════════════════════════════════
 
-let ytChannelIdCache = null;
 const ytCache = { data: null, expiresAt: 0 };
-
-async function getYouTubeChannelId(apiKey, handle, referer) {
-  if (ytChannelIdCache) return ytChannelIdCache;
-  const resp = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=${handle}&key=${apiKey}`, {
-    headers: { 'Referer': referer }
-  });
-  if (resp.ok) {
-    const data = await resp.json();
-    if (data.items && data.items.length > 0) {
-      ytChannelIdCache = data.items[0].id;
-      return ytChannelIdCache;
-    }
-  }
-  return null;
-}
 
 async function fetchYouTubeStatus() {
   const now = Date.now();
@@ -290,7 +274,7 @@ async function fetchYouTubeStatus() {
   let handle = process.env.YOUTUBE_CHANNEL_HANDLE || '@turkdostclan55';
   if (!handle.startsWith('@')) handle = '@' + handle;
   const channelUrl = `https://www.youtube.com/${handle}/live`;
-  
+
   if (!apiKey || apiKey.startsWith('BURAYA')) {
     return { platform: 'youtube', is_live: false, viewer_count: 0, channel_url: channelUrl, error: 'API Key eksik' };
   }
@@ -298,68 +282,60 @@ async function fetchYouTubeStatus() {
   try {
     // Google Cloud API Referer kisitlamasini asmak icin proxy sunucunun adresini iletiyoruz
     const referer = process.env.RENDER_EXTERNAL_URL || 'https://tdctest.onrender.com/';
-    
-    let channelId = process.env.YOUTUBE_CHANNEL_ID;
-    if (!channelId) {
-       channelId = await getYouTubeChannelId(apiKey, handle, referer);
-    }
-    
-    if (!channelId) {
-      throw new Error('Kanal ID bulunamadi');
-    }
+    const channelId = process.env.YOUTUBE_CHANNEL_ID || 'UCNpMoAARNn9fenbbyWZB2Wg';
 
     // Render vb. bulut sunucularinin IP'leri YouTube tarafindan (Bot/Consent) engellendigi icin 
     // veya YouTube API Search gecikmeli calistigi icin "Decapi" uzerinden guncel videoyu buluyoruz.
     const decapiResp = await fetch(`https://decapi.me/youtube/latest_video?id=${channelId}`);
     if (!decapiResp.ok) throw new Error(`Decapi Hatasi: ${decapiResp.status}`);
-    
+
     const decapiText = await decapiResp.text();
-    
+
     const match = decapiText.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
-    
+
     if (match && match[1]) {
       const videoId = match[1];
-      
+
       let viewerCount = 0;
       let title = '';
       let thumbnail = '';
-      
+
       const videoResp = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${apiKey}`, {
-         headers: { 'Referer': referer }
+        headers: { 'Referer': referer }
       });
-      
+
       if (videoResp.ok) {
-          const videoData = await videoResp.json();
-          if (videoData.items && videoData.items.length > 0) {
-              const item = videoData.items[0];
-              
-              // Sadece aktif olarak yayında olan (liveBroadcastContent === 'live' ve bitiş tarihi olmayan) videolar canlıdır
-              const isLive = item.snippet?.liveBroadcastContent === 'live' && !item.liveStreamingDetails?.actualEndTime;
+        const videoData = await videoResp.json();
+        if (videoData.items && videoData.items.length > 0) {
+          const item = videoData.items[0];
 
-              if (isLive) {
-                  title = item.snippet?.title || '';
-                  thumbnail = item.snippet?.thumbnails?.maxres?.url || item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '';
-                  if (item.liveStreamingDetails?.concurrentViewers) {
-                      viewerCount = parseInt(item.liveStreamingDetails.concurrentViewers, 10);
-                  }
-                  
-                  const result = {
-                      platform: 'youtube',
-                      is_live: true,
-                      viewer_count: viewerCount,
-                      title: title,
-                      thumbnail: thumbnail,
-                      channel_url: `https://www.youtube.com/watch?v=${videoId}`
-                  };
+          // Sadece aktif olarak yayında olan (liveBroadcastContent === 'live' ve bitiş tarihi olmayan) videolar canlıdır
+          const isLive = item.snippet?.liveBroadcastContent === 'live' && !item.liveStreamingDetails?.actualEndTime;
 
-                  ytCache.data = result;
-                  ytCache.expiresAt = now + (5 * 1000); 
-                  return result;
-              }
+          if (isLive) {
+            title = item.snippet?.title || '';
+            thumbnail = item.snippet?.thumbnails?.maxres?.url || item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '';
+            if (item.liveStreamingDetails?.concurrentViewers) {
+              viewerCount = parseInt(item.liveStreamingDetails.concurrentViewers, 10);
+            }
+
+            const result = {
+              platform: 'youtube',
+              is_live: true,
+              viewer_count: viewerCount,
+              title: title,
+              thumbnail: thumbnail,
+              channel_url: `https://www.youtube.com/watch?v=${videoId}`
+            };
+
+            ytCache.data = result;
+            ytCache.expiresAt = now + (5 * 1000);
+            return result;
           }
+        }
       }
     }
-    
+
     // Kanalda canli yayin yok
     const offlineResult = { platform: 'youtube', is_live: false, viewer_count: 0, title: '', thumbnail: '', channel_url: channelUrl };
     ytCache.data = offlineResult;
@@ -367,8 +343,8 @@ async function fetchYouTubeStatus() {
     return offlineResult;
 
   } catch (err) {
-      console.error('[YouTube] Hata:', err.message);
-      return { platform: 'youtube', is_live: false, viewer_count: 0, channel_url: channelUrl, error: err.message };
+    console.error('[YouTube] Hata:', err.message);
+    return { platform: 'youtube', is_live: false, viewer_count: 0, channel_url: channelUrl, error: err.message };
   }
 }
 
@@ -386,7 +362,7 @@ app.listen(PORT, () => {
 
   if (!kickOk) console.warn('   ⚠️  Kick API anahtarları tanımlı değil (.env dosyasını düzenle)');
   if (kickOk) console.log('   ✅ Kick API anahtarları tanımlı');
-  
+
   if (!ytOk) console.warn('   ⚠️  YouTube API Key eksik (.env dosyasını düzenle)');
   if (ytOk) console.log('   ✅ YouTube API Key tanımlı\n');
   else console.log();
