@@ -260,13 +260,14 @@ app.get('/api/stream-status', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════
-//  YOUTUBE 2-KATMANLI MİMARİ
-//  Katman 1: WebSub (PubSubHubbub) Webhook (Anlık Push)
-//  Katman 2: YouTube RSS XML Feed (Polling & Fallback)
+//  YOUTUBE 3-KATMANLI HİBRİT MİMARİ
+//  Katman 1: Doğrudan /live Taraması (Ultra Hızlı: 0-10sn)
+//  Katman 2: WebSub (PubSubHubbub) Webhook (Anlık Push)
+//  Katman 3: YouTube RSS XML Feed (Polling & Fallback)
 // ══════════════════════════════════════════════════
 
 /**
- * YouTube Data API v3 ile Video ID'sinin Canlılık ve Yayın Detaylarını Doğrular
+ * YouTube Data API v3 ile Video ID'sinin Canlılık ve Yayın Detaylarını Doğrular (1 Kota Birimi)
  */
 async function checkYouTubeVideoDetails(videoId) {
   const apiKey = process.env.YOUTUBE_API_KEY;
@@ -341,7 +342,67 @@ async function checkYouTubeVideoDetails(videoId) {
 }
 
 /**
- * 2. Katman: YouTube RSS XML Akışından En Son Video ID'sini Çeker (Decapi Bağımsız)
+ * 1. Katman: YouTube /live Sayfasından Anlık Canlı Video ID'sini Çeker (Ultra Hızlı: 0-10sn)
+ */
+async function fetchLiveVideoIdDirectly(handle, channelId) {
+  const urls = [];
+  if (handle) {
+    let cleanHandle = handle.startsWith('@') ? handle : '@' + handle;
+    urls.push(`https://www.youtube.com/${cleanHandle}/live`);
+  }
+  if (channelId) {
+    urls.push(`https://www.youtube.com/channel/${channelId}/live`);
+  }
+
+  for (const url of urls) {
+    try {
+      const resp = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9,tr;q=0.8'
+        },
+        redirect: 'follow'
+      });
+
+      if (!resp.ok) continue;
+
+      // 1. URL yönlendirmesinde watch?v= var mı?
+      const urlMatch = resp.url.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
+      if (urlMatch && urlMatch[1]) {
+        return urlMatch[1];
+      }
+
+      const html = await resp.text();
+
+      // Canonical watch URL'si var mı? (YouTube canlı yayındayken canonical olarak watch?v= döner)
+      const canonicalMatch = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})"/);
+      if (canonicalMatch && canonicalMatch[1]) {
+        return canonicalMatch[1];
+      }
+
+      // Canlı yayın bayrağı kontrolü
+      const isLiveIndicator = html.includes('"isLive":true') || 
+                              html.includes('"isLiveBroadcast":true') || 
+                              html.includes('"status":"LIVE"') ||
+                              html.includes('"isLiveContent":true');
+
+      if (isLiveIndicator) {
+        const vidMatch = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+        if (vidMatch && vidMatch[1]) {
+          return vidMatch[1];
+        }
+      }
+    } catch (err) {
+      console.warn(`[YouTube /live] ${url} kontrol hatası:`, err.message);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 3. Katman: YouTube RSS XML Akışından En Son Video ID'sini Çeker (Decapi Bağımsız Fallback)
  */
 async function fetchLatestVideoIdFromRSS(channelId) {
   try {
@@ -371,7 +432,7 @@ async function fetchLatestVideoIdFromRSS(channelId) {
 }
 
 /**
- * YouTube Durumunu Getirir (RAM Önbellek -> RSS & Data API Doğrulama)
+ * YouTube Durumunu Getirir (RAM Önbellek -> 1. Katman: /live -> 3. Katman: RSS -> Data API Doğrulama)
  */
 async function fetchYouTubeStatus() {
   const now = Date.now();
@@ -390,21 +451,31 @@ async function fetchYouTubeStatus() {
   }
 
   try {
-    // 2. Katman: RSS üzerinden en güncel video ID'sini al
-    const latestVideoId = await fetchLatestVideoIdFromRSS(channelId);
-
-    if (latestVideoId) {
-      const result = await checkYouTubeVideoDetails(latestVideoId);
-      if (result) {
-        ytCache.data = result;
-        // Canlıysa 15 sn, offline ise 30 sn cache süresi uygula (Kota tasarrufu)
-        ytCache.expiresAt = now + (result.is_live ? TIMINGS.YT_LIVE_CACHE_TTL : TIMINGS.YT_OFFLINE_CACHE_TTL);
-        ytCache.latestVideoId = latestVideoId;
-        return result;
+    // 1. Katman: Doğrudan /live sayfasından anlık kontrol (0-10 saniye içinde algılama)
+    const directVideoId = await fetchLiveVideoIdDirectly(handle, channelId);
+    if (directVideoId) {
+      const directResult = await checkYouTubeVideoDetails(directVideoId);
+      if (directResult && directResult.is_live) {
+        ytCache.data = directResult;
+        ytCache.expiresAt = now + TIMINGS.YT_LIVE_CACHE_TTL;
+        ytCache.latestVideoId = directVideoId;
+        return directResult;
       }
     }
 
-    // Kanalda aktif canlı yayın yok
+    // 3. Katman Fallback: RSS akışı üzerinden en güncel video kontrolü
+    const rssVideoId = await fetchLatestVideoIdFromRSS(channelId);
+    if (rssVideoId) {
+      const rssResult = await checkYouTubeVideoDetails(rssVideoId);
+      if (rssResult && rssResult.is_live) {
+        ytCache.data = rssResult;
+        ytCache.expiresAt = now + TIMINGS.YT_LIVE_CACHE_TTL;
+        ytCache.latestVideoId = rssVideoId;
+        return rssResult;
+      }
+    }
+
+    // Aktif canlı yayın yok (Offline)
     const offlineResult = {
       platform: 'youtube',
       is_live: false,
@@ -544,7 +615,7 @@ app.listen(PORT, async () => {
   if (!ytOk) console.warn('   ⚠️  YouTube API Key eksik (.env dosyasını düzenle)');
   if (ytOk) {
     console.log('   ✅ YouTube API Key tanımlı');
-    console.log('   ✅ 2-Katmanlı YouTube Mimarisi devrede (Katman 1: WebSub Push | Katman 2: RSS Feed)');
+    console.log('   ✅ 3-Katmanlı YouTube Mimarisi devrede (Katman 1: /live Hızlı Tarama | Katman 2: WebSub Push | Katman 3: RSS Feed)');
     // İlk abonelik talebini gönder
     await subscribeToYouTubeWebSub();
     // 24 saatte bir WebSub aboneliğini tazele
